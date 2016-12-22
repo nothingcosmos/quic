@@ -1,0 +1,158 @@
+diff --git a/src/net/tools/quic/quic_client_bin.cc b/src/net/tools/quic/quic_client_bin.cc
+index 8c97948..3b55485 100644
+--- a/src/net/tools/quic/quic_client_bin.cc
++++ b/src/net/tools/quic/quic_client_bin.cc
+@@ -48,6 +48,7 @@
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
++#include "base/files/file_util.h"
+ #include "net/base/net_errors.h"
+ #include "net/base/privacy_mode.h"
+ #include "net/cert/cert_verifier.h"
+@@ -103,6 +104,9 @@ bool FLAGS_version_mismatch_ok = false;
+ bool FLAGS_redirect_is_success = true;
+ // Initial MTU of the connection.
+ int32_t FLAGS_initial_mtu = 0;
++string FLAGS_filepath = "";
++int32_t FLAGS_recvsize = 1024*1024*2;
++
+ 
+ class FakeProofVerifier : public ProofVerifier {
+  public:
+@@ -248,6 +252,58 @@ int main(int argc, char* argv[]) {
+   string host_port =
+       base::StringPrintf("%s:%d", ip_addr.ToString().c_str(), port);
+   VLOG(1) << "Resolved " << host << " to " << host_port << endl;
++  //config and tagvector
++  net::QuicConfig client_config;
++
++  if (line->HasSwitch("filepath")) {
++    FLAGS_filepath = line->GetSwitchValueASCII("filepath");
++    VLOG(1) << "filepath:" << FLAGS_filepath;
++  }
++  if (line->HasSwitch("recvsize")) {
++    int tmp;
++    if (base::StringToInt(line->GetSwitchValueASCII("recvsize"),
++          &tmp)) {
++      FLAGS_recvsize = tmp;
++      client_config.SetSocketReceiveBufferToSend(tmp);
++      VLOG(1) << "recvsize:" << FLAGS_recvsize;
++    }
++  }
++  const int32_t kMaxUndecryptablePackets = 100;
++  client_config.set_max_undecryptable_packets(kMaxUndecryptablePackets*100);
++  //  client_config.SetBytesForConnectionIdToSend(0);
++
++  net::QuicTagVector sopt;
++  if (line->HasSwitch("bbr")) {
++    VLOG(0) << "using BBR";
++    sopt.push_back(net::kTBBR);
++  }
++  if (line->HasSwitch("qbic")) {
++    VLOG(0) << "using QBIC";
++    sopt.push_back(net::kQBIC);
++  }
++  client_config.SetClientConnectionOptions(sopt);
++
++  if (line->HasSwitch("forceholb")) {
++    VLOG(0) << "using forceHolBlocking";
++    client_config.SetForceHolBlocking();
++  }
++
++  // Construct the string body from flags, if provided.
++  string body = FLAGS_body;
++  if (!FLAGS_body_hex.empty()) {
++    DCHECK(FLAGS_body.empty()) << "Only set one of --body and --body_hex.";
++    body = net::QuicUtils::HexDecode(FLAGS_body_hex);
++  }
++  if (!FLAGS_filepath.empty()) {
++    base::FilePath path = base::FilePath(FLAGS_filepath);
++    VLOG(1) << "filepath:"  << FLAGS_filepath << "," << path.value();
++    if (base::ReadFileToString(path, &body)) {
++      VLOG(1) << "ReadFile Size=" << body.size();
++    } else {
++      VLOG(1) << "Failed ReadFile, not found:" << path.value();
++      return 1;
++    }
++  }
+ 
+   // Build the client, and try to connect.
+   net::EpollServer epoll_server;
+@@ -266,6 +322,9 @@ int main(int argc, char* argv[]) {
+   std::unique_ptr<CTVerifier> ct_verifier(new MultiLogCTVerifier());
+   std::unique_ptr<CTPolicyEnforcer> ct_policy_enforcer(new CTPolicyEnforcer());
+   std::unique_ptr<ProofVerifier> proof_verifier;
++
++  proof_verifier.reset(new FakeProofVerifier());
++#if 0
+   if (line->HasSwitch("disable-certificate-verification")) {
+     proof_verifier.reset(new FakeProofVerifier());
+   } else {
+@@ -273,8 +332,9 @@ int main(int argc, char* argv[]) {
+         cert_verifier.get(), ct_policy_enforcer.get(),
+         transport_security_state.get(), ct_verifier.get()));
+   }
++#endif
+   net::QuicClient client(net::QuicSocketAddress(ip_addr, port), server_id,
+-                         versions, &epoll_server, std::move(proof_verifier));
++                         versions, client_config, &epoll_server, std::move(proof_verifier));
+   client.set_initial_max_packet_length(
+       FLAGS_initial_mtu != 0 ? FLAGS_initial_mtu : net::kDefaultMaxPacketSize);
+   if (!client.Initialize()) {
+@@ -294,13 +354,14 @@ int main(int argc, char* argv[]) {
+     return 1;
+   }
+   cout << "Connected to " << host_port << endl;
+-
++#if 0
+   // Construct the string body from flags, if provided.
+   string body = FLAGS_body;
+   if (!FLAGS_body_hex.empty()) {
+     DCHECK(FLAGS_body.empty()) << "Only set one of --body and --body_hex.";
+     body = net::QuicUtils::HexDecode(FLAGS_body_hex);
+   }
++#endif
+ 
+   // Construct a GET or POST request for supplied URL.
+   SpdyHeaderBlock header_block;
+diff --git a/src/net/tools/quic/quic_server_bin.cc b/src/net/tools/quic/quic_server_bin.cc
+index 6fc2524..2ef8bba 100644
+--- a/src/net/tools/quic/quic_server_bin.cc
++++ b/src/net/tools/quic/quic_server_bin.cc
+@@ -20,6 +20,7 @@
+ 
+ // The port the quic server will listen on.
+ int32_t FLAGS_port = 6121;
++int32_t FLAGS_recvsize = 1024*1024*2;
+ 
+ std::unique_ptr<net::ProofSource> CreateProofSource(
+     const base::FilePath& cert_path,
+@@ -80,6 +81,27 @@ int main(int argc, char* argv[]) {
+   }
+ 
+   net::QuicConfig config;
++  net::QuicTagVector ropt;
++  net::QuicTagVector sopt;
++
++  ropt.push_back(net::kTBBR);
++  ropt.push_back(net::kQBIC);
++  config.SetInitialReceivedConnectionOptions(ropt);
++
++  sopt.push_back(net::kTBBR);
++  sopt.push_back(net::kQBIC);
++  config.SetConnectionOptionsToSend(sopt);
++
++  if (line->HasSwitch("recvsize")) {
++    int tmp;
++    if (base::StringToInt(line->GetSwitchValueASCII("recvsize"),
++          &tmp)) {
++      FLAGS_recvsize = tmp;
++      config.SetSocketReceiveBufferToSend(tmp);
++      VLOG(0) << "recvsize:" << FLAGS_recvsize;
++    }
++  }
++
+   net::QuicServer server(
+       CreateProofSource(line->GetSwitchValuePath("certificate_file"),
+                         line->GetSwitchValuePath("key_file")),
